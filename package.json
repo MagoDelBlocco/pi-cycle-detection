@@ -1,0 +1,14 @@
+{
+  "name": "cycle-detection",
+  "version": "1.0.0",
+  "description": "Cycle-detection monitor for agentic harness — detects exact-repeat loops and structural oscillation",
+  "private": true,
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1"
+  }
+}
