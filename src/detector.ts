@@ -81,7 +81,8 @@ export function detectExactRepeat(
 	window: number,
 	tRepeat: number,
 ): { sig: [string, string]; count: number; stepIndices: number[] } | null {
-	const recent = records.slice(-window);
+	// Guard: slice(-0) returns the full array in JS; treat window=0 as empty.
+	const recent = window <= 0 ? [] : records.slice(-window);
 	const bySig = new Map<string, StepRecord[]>();
 
 	for (const r of recent) {
@@ -156,7 +157,8 @@ export function detectOscillation(
 	minRepsFn: (p: number) => number,
 	hasOutcomeState: boolean,
 ): { period: number; span: number; stepIndices: number[] } | null {
-	const recent = records.slice(-window);
+	// Guard: slice(-0) returns the full array in JS; treat window=0 as empty.
+	const recent = window <= 0 ? [] : records.slice(-window);
 	// Use outcome_state_hash if available; fall back to action-pattern.
 	const states = hasOutcomeState
 		? recent.map((r) => r.outcome_state_hash)

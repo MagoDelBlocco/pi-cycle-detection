@@ -5,8 +5,8 @@
  * - EXACT_REPEAT: same action + same args + same observation, repeatedly
  * - OSCILLATION: cycling through a small set of world-states
  *
- * Runs in shadow mode by default — logs fires, takes no action.
- * Enable interventions via /cycle enable or config.
+ * Runs in active mode by default — intervenes when cycles are detected.
+ * Switch to shadow mode via /cycle shadow.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -39,7 +39,7 @@ const state: ExtensionState = {
 	records: [],
 	stepCounter: 0,
 	config: { ...DEFAULT_CONFIG },
-	shadowMode: true,
+	shadowMode: false,
 	enabled: true,
 	fires: [],
 };
@@ -118,9 +118,12 @@ export default function (pi: ExtensionAPI) {
 		state.records = [];
 		state.stepCounter = 0;
 		state.fires = [];
+		const modeLabel = state.shadowMode ? "shadow" : "active";
+		const modeBg = state.shadowMode ? "customMessageBg" : "toolSuccessBg";
+		const modeFg = state.shadowMode ? "accent" : "success";
 		ctx.ui.setStatus(
 			"cycle-detection",
-			`│ ${ctx.ui.theme.bg("customMessageBg", ctx.ui.theme.fg("accent", "cycle-detection: shadow"))}`,
+			`│ ${ctx.ui.theme.bg(modeBg, ctx.ui.theme.fg(modeFg, `cycle-detection: ${modeLabel}`))}`,
 		);
 	});
 

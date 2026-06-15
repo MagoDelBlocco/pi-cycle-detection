@@ -33,16 +33,24 @@ const VOLATILE_KEY_PATTERNS = [
 
 /**
  * Recursively strip volatile keys from an object and sort remaining keys.
+ * Tracks visited objects to prevent infinite recursion on circular references.
  */
-function canonicalizeValue(value: unknown): unknown {
-	if (value === null || value === undefined) return value;
+function canonicalizeValue(
+	value: unknown,
+	visited: WeakSet<object> = new WeakSet(),
+): unknown {
+	if (value === null || value === undefined) return null;
 	if (typeof value === "string") {
 		// Normalize whitespace: collapse runs of whitespace to single space, trim.
 		return value.replace(/\s+/g, " ").trim();
 	}
 	if (typeof value === "number" || typeof value === "boolean") return value;
-	if (Array.isArray(value)) return value.map(canonicalizeValue);
+	if (Array.isArray(value))
+		return value.map((v) => canonicalizeValue(v, visited));
 	if (typeof value === "object") {
+		// Circular reference guard: if already visited, return a sentinel.
+		if (visited.has(value)) return "[circular]";
+		visited.add(value);
 		const entries = Object.entries(value as Record<string, unknown>);
 		const filtered: [string, unknown][] = entries.filter(([key]) => {
 			return !VOLATILE_KEY_PATTERNS.some((pat) => pat.test(key));
@@ -51,7 +59,7 @@ function canonicalizeValue(value: unknown): unknown {
 		filtered.sort((a, b) => a[0].localeCompare(b[0]));
 		const result: Record<string, unknown> = {};
 		for (const [k, v] of filtered) {
-			result[k] = canonicalizeValue(v);
+			result[k] = canonicalizeValue(v, visited);
 		}
 		return result;
 	}
