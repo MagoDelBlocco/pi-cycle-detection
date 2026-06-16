@@ -3,15 +3,16 @@
  *
  * Wires two detection layers into the pi event lifecycle:
  *
- * 1. **Step-based** (existing): monitors tool-call trajectories for
- *    exact-repeat loops and structural oscillation. Fires at tool_result.
+ * 1. **Step-based**: monitors tool-call trajectories for exact-repeat loops
+ *    and structural oscillation. Fires at tool_result. Intervenes by steering
+ *    the agent with a course-correction message (never kills the process).
  *
- * 2. **Stream-based** (new): monitors thinking_delta and text_delta
- *    character streams for sentence-level repetition. Fires mid-stream
- *    and can abort + recover.
+ * 2. **Stream-based**: monitors thinking_delta and text_delta character
+ *    streams for sentence-level repetition. Fires mid-stream and can
+ *    abort + recover the in-flight message.
  *
- * Active mode (default): both detectors run and intervene when cycles
- * are detected. Flip `shadow: true` to observe without intervention.
+ * Active mode (default): both detectors run and intervene when cycles are
+ * detected. Switch to shadow mode (observe only) via `/cycle shadow`.
  */
 
 import { exec } from "node:child_process";
@@ -21,6 +22,8 @@ import {
 	runMonitor,
 	type StepRecord,
 	type MonitorConfig,
+	type Verdict as StepVerdict,
+	type Severity,
 	DEFAULT_CONFIG,
 } from "./detector.js";
 import {
@@ -35,24 +38,21 @@ import {
 	type Severity as StreamSeverity,
 } from "./stream-detector.js";
 
-// ── Extended Config ────────────────────────────────────────────
-
-/** Shadow-mode flag layered on top of MonitorConfig. */
-interface StepDetectorConfig extends MonitorConfig {
-	/** When true, step detector reports but never intervenes. */
-	shadow: boolean;
-}
-
 // ── Extension State ────────────────────────────────────────────
 
 interface CycleState {
-	// Master shadow flag — gates ALL intervention across both detectors
+	/** Master enable flag — gates ALL detection across both layers. */
+	enabled: boolean;
+	/** Master shadow flag — when true, detect and report but never intervene. */
 	shadow: boolean;
 
 	// Step-based detector
-	stepConfig: StepDetectorConfig;
+	stepConfig: MonitorConfig;
 	stepRecords: StepRecord[];
 	stepStepIndex: number;
+	/** Severity last surfaced by the step detector, to avoid re-steering every
+	 *  tool_result while the agent is stuck in the same cycle. */
+	lastStepSeverity: Severity;
 
 	// Stream-based detectors (one per content type, reused across messages)
 	thinkingDetector: StreamDetector;
@@ -74,10 +74,12 @@ interface CycleState {
 function createState(): CycleState {
 	const shadow = false; // Default: active mode
 	return {
+		enabled: true,
 		shadow,
-		stepConfig: { ...DEFAULT_CONFIG, shadow },
+		stepConfig: { ...DEFAULT_CONFIG },
 		stepRecords: [],
 		stepStepIndex: 0,
+		lastStepSeverity: "none",
 		thinkingDetector: new StreamDetector({ ...DEFAULT_STREAM_CONFIG, shadow }),
 		textDetector: new StreamDetector({ ...DEFAULT_STREAM_CONFIG, shadow }),
 		pendingAbort: null,
@@ -88,28 +90,19 @@ function createState(): CycleState {
 
 // ── Outcome State Extraction ───────────────────────────────────
 /**
- * Extract a proxy outcome state from tool input.
+ * Extract a proxy outcome state from a tool call.
  *
- * KNOWN ISSUE: same-file edits collapse to identical state regardless
- * of content. This causes false-positive oscillation for progressive
- * edits. Documented in integration tests.
- *
- * Mitigation: when hasOutcomeState is false, the detector falls back
- * to action-pattern matching which includes canonicalized args.
+ * The state proxy is the tool identity plus its full canonicalized args.
+ * For write/edit this includes the content / edit operations, so progressive
+ * edits to a single file produce *distinct* states (no false-positive
+ * oscillation on normal iterative editing), while a genuine edit↔revert loop
+ * reproduces identical states and is still caught.
  */
 function extractOutcomeState(toolName: string, input: unknown): string {
-	if (toolName === "write" || toolName === "edit") {
-		const path = (input as { path?: string })?.path;
-		return path ? `file:${path}` : "";
-	}
-	if (toolName === "bash") {
-		const cmd = (input as { command?: string })?.command;
-		return cmd ? `cmd:${cmd}` : "";
-	}
 	return `${toolName}:${canonicalizeArgs(input)}`;
 }
 
-/** Extract observation text from content array. */
+/** Extract observation text from a tool-result content array. */
 function extractObservationText(content: unknown[]): string {
 	if (!Array.isArray(content)) return "";
 	return content
@@ -127,89 +120,86 @@ function extractObservationText(content: unknown[]): string {
 /**
  * Truncate an aborted assistant message based on the cycle verdict.
  *
- * For thinking cycles: strip thinking content, keep tool calls.
- * For text cycles: truncate text at cycle boundary, strip tool calls.
+ * Tool calls are always stripped: they were generated from cycled reasoning,
+ * and a tool call left in the finalized message would (a) dangle without a
+ * matching tool result and (b) for extended-thinking models break the
+ * thinking-block/tool-use pairing the API requires on the next turn. We keep
+ * the message to a clean text-only stop and let the steer message re-drive.
  */
 function truncateAbortedMessage(
 	message: Record<string, unknown>,
 	abortInfo: NonNullable<CycleState["pendingAbort"]>,
 ): Record<string, unknown> {
 	const content = (message.content as unknown[]) ?? [];
-
-	if (abortInfo.contentType === "thinking") {
-		// Remove thinking blocks, keep text and tool calls
-		const cleaned = content.filter(
-			(block: unknown) =>
-				typeof block !== "object" ||
-				(block as Record<string, unknown>).type !== "thinking",
-		);
-		return {
-			...message,
-			content: cleaned,
-			stopReason: cleaned.some(
-				(b: unknown) =>
-					typeof b === "object" &&
-					(b as Record<string, unknown>).type === "toolCall",
-			)
-				? "toolUse"
-				: "stop",
-		};
-	}
-
-	// Text cycle: truncate text content
 	const cleaned: unknown[] = [];
+
 	for (const block of content) {
 		if (typeof block !== "object" || block === null) continue;
 		const bc = block as Record<string, unknown>;
 
-		if (bc.type === "thinking") {
-			// Strip thinking — it led to the cycle
-			continue;
-		}
+		// Strip thinking (it led to the cycle) and tool calls (see above).
+		if (bc.type === "thinking" || bc.type === "toolCall") continue;
 
 		if (bc.type === "text") {
-			// Keep text up to the cycle point if we have an offset
 			const fullText = (bc.text as string) ?? "";
+			// For a text cycle, keep only the text before the loop began.
 			const cutOffset =
-				"firstRepeatOffset" in abortInfo.verdict
-					? (abortInfo.verdict as { firstRepeatOffset: number })
-							.firstRepeatOffset
-					: "patternStartOffset" in abortInfo.verdict
-						? (abortInfo.verdict as { patternStartOffset: number })
-								.patternStartOffset
-						: 0;
-			// Truncate: keep text before the cycle started
-			const truncated = cutOffset > 0 ? fullText.slice(0, cutOffset) : fullText;
-			if (truncated.length > 0) {
+				abortInfo.contentType === "text"
+					? "firstRepeatOffset" in abortInfo.verdict
+						? (abortInfo.verdict as { firstRepeatOffset: number })
+								.firstRepeatOffset
+						: "patternStartOffset" in abortInfo.verdict
+							? (abortInfo.verdict as { patternStartOffset: number })
+									.patternStartOffset
+							: 0
+					: 0;
+			const truncated =
+				cutOffset > 0 ? fullText.slice(0, cutOffset) : fullText;
+			if (truncated.trim().length > 0) {
 				cleaned.push({ ...bc, text: truncated.trimEnd() });
 			}
 		}
-		// Strip tool calls — they were generated from cycled reasoning
 	}
 
-	return {
-		...message,
-		content: cleaned,
-		stopReason: "stop",
-	};
+	// Never emit an empty assistant message — leave a breadcrumb instead.
+	if (cleaned.length === 0) {
+		cleaned.push({
+			type: "text",
+			text: "[response interrupted: repetition detected]",
+		});
+	}
+
+	return { ...message, content: cleaned, stopReason: "stop" };
 }
 
 // ── Steer Message Templates ────────────────────────────────────
 
-function makeSteerContent(
+function makeStreamSteer(
 	verdict: StreamVerdict,
 	contentType: "thinking" | "text",
 ): string {
 	const label = contentType === "thinking" ? "reasoning" : "answer";
-
 	if (verdict.type === "EXACT_REPEAT") {
 		return `⚠ Cycle detection: your ${label} repeated the same sentence ${verdict.count} times. Break out of this loop and ${contentType === "thinking" ? "proceed with tool calls or a concrete answer" : "try a different approach or conclude your response"}.`;
 	}
 	if (verdict.type === "OSCILLATION") {
 		return `⚠ Cycle detection: your ${label} oscillated with period ${verdict.period} sentences. ${contentType === "thinking" ? "Shift to a different line of reasoning" : "Break the pattern and provide new content"}.`;
 	}
-	// Fallback (OK — shouldn't reach here)
 	return `⚠ Cycle detection: your ${label} showed repetitive patterns. Try a different approach.`;
+}
+
+function makeStepSteer(verdict: StepVerdict, severity: Severity): string {
+	const force =
+		severity === "hard"
+			? "You are stuck in a loop and must stop repeating it now."
+			: "You appear to be looping.";
+	if (verdict.type === "EXACT_REPEAT") {
+		return `⚠ Cycle detection: the action "${verdict.sig[0]}" was issued ${verdict.count}× in a row with unchanged output. ${force} Step back, re-examine your assumptions, and try a different approach.`;
+	}
+	if (verdict.type === "OSCILLATION") {
+		return `⚠ Cycle detection: your tool calls are cycling through ${verdict.period} state(s) over ${verdict.span} steps with no net progress. ${force} Reconsider your overall strategy rather than continuing the cycle.`;
+	}
+	return `⚠ Cycle detection: repetitive tool-call pattern detected. ${force}`;
 }
 
 // ── Desktop Notification ───────────────────────────────────────
@@ -230,14 +220,32 @@ async function notifyDesktop(): Promise<void> {
 	}
 }
 
+// ── Status Bar ─────────────────────────────────────────────────
+
+function statusText(state: CycleState): string {
+	if (!state.enabled) return "cycle-detection: off";
+	const mode = state.shadow ? "shadow" : "active";
+	const fires = state.stepWarnCount + state.stepHardCount;
+	return fires > 0
+		? `cycle-detection: ${mode} (${fires} fires)`
+		: `cycle-detection: ${mode}`;
+}
+
 // ── Extension Factory ──────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
 	const state = createState();
 
+	const syncStreamShadow = () => {
+		state.thinkingDetector.setConfig({ shadow: state.shadow });
+		state.textDetector.setConfig({ shadow: state.shadow });
+	};
+
 	// ── Stream-based: message_update ───────────────────────────
 
 	pi.on("message_update", async (event, ctx) => {
+		if (!state.enabled) return;
+
 		const ame = event.assistantMessageEvent;
 		if (!ame || typeof ame !== "object") return;
 		const ameTyped = ame as Record<string, unknown>;
@@ -262,7 +270,7 @@ export default function (pi: ExtensionAPI) {
 		if (severity !== "none") {
 			const modeLabel = state.shadow ? "[shadow]" : "[ACTIVE]";
 			ctx.ui.setStatus(
-				"cycle-detect",
+				"cycle-detection",
 				`${modeLabel} ${contentType}: ${verdict.type} (${severity})`,
 			);
 		}
@@ -287,17 +295,13 @@ export default function (pi: ExtensionAPI) {
 	pi.on("message_end", async (event, ctx) => {
 		if (event.message.role !== "assistant") return;
 
-		// If we flagged an abort, truncate the message
+		// If we flagged an abort, truncate the message and steer.
 		if (state.pendingAbort !== null) {
+			const abortInfo = state.pendingAbort;
 			const msg = event.message as unknown as Record<string, unknown>;
-			const truncated = truncateAbortedMessage(msg, state.pendingAbort);
+			const truncated = truncateAbortedMessage(msg, abortInfo);
 
-			// Send steer message to redirect the model
-			const steerText = makeSteerContent(
-				state.pendingAbort.verdict,
-				state.pendingAbort.contentType,
-			);
-
+			const steerText = makeStreamSteer(abortInfo.verdict, abortInfo.contentType);
 			pi.sendMessage(
 				{
 					customType: "cycle-detection",
@@ -308,163 +312,182 @@ export default function (pi: ExtensionAPI) {
 			);
 
 			state.pendingAbort = null;
-			ctx.ui.setStatus("cycle-detect", "");
+			ctx.ui.setStatus("cycle-detection", statusText(state));
 
-			// Desktop notification
-			notifyDesktop().catch((err) => {
-				// Non-fatal — silently ignore if notify-send is unavailable
-				void err;
-			});
+			void notifyDesktop();
 
 			return { message: truncated as never };
 		}
 
-		// Clear status after normal message end
-		ctx.ui.setStatus("cycle-detect", "");
+		// Clear transient stream status after a normal message end.
+		ctx.ui.setStatus("cycle-detection", statusText(state));
 	});
 
-	// ── Step-based: tool_call / tool_result ────────────────────
+	// ── Step-based: tool_result ────────────────────────────────
 
-	// Track tool calls so we can match them with results
-	const pendingToolCalls = new Map<
-		string,
-		{
-			toolName: string;
-			input: unknown;
-			timestamp: number;
-		}
-	>();
-
-	pi.on("tool_execution_start", async (event, _ctx) => {
-		pendingToolCalls.set(event.toolCallId, {
-			toolName: event.toolName,
-			input: event.args,
-			timestamp: Date.now(),
-		});
-	});
-
-	pi.on("tool_result", async (event, _ctx) => {
-		const pending = pendingToolCalls.get(event.toolCallId);
-		if (!pending) return;
-		pendingToolCalls.delete(event.toolCallId);
+	pi.on("tool_result", async (event, ctx) => {
+		if (!state.enabled) return;
 
 		const obsText = extractObservationText((event.content as unknown[]) ?? []);
-
 		const record: StepRecord = {
 			step_index: state.stepStepIndex++,
 			action_type: event.toolName,
-			canonical_args: canonicalizeArgs(pending.input),
+			canonical_args: canonicalizeArgs(event.input),
 			observation_hash: hashObservation(obsText),
 			outcome_state_hash: hashOutcomeState(
-				extractOutcomeState(event.toolName, pending.input),
+				extractOutcomeState(event.toolName, event.input),
 			),
 		};
 
 		state.stepRecords.push(record);
 
-		// Trim to prevent unbounded growth
+		// Trim to prevent unbounded growth.
 		const maxKeep = state.stepConfig.window + state.stepConfig.warmupSteps + 10;
 		if (state.stepRecords.length > maxKeep) {
 			state.stepRecords = state.stepRecords.slice(-maxKeep);
 		}
 
-		// Run step-based detector
-		const { verdict, severity } = runMonitor(
-			state.stepRecords,
-			state.stepConfig,
-		);
+		const { verdict, severity } = runMonitor(state.stepRecords, state.stepConfig);
+
+		if (verdict.type === "OK") {
+			// Cycle cleared — allow the next genuine cycle to re-trigger a steer.
+			state.lastStepSeverity = "none";
+			return;
+		}
 
 		if (severity === "warn") state.stepWarnCount++;
 		if (severity === "hard") state.stepHardCount++;
 
-		if (verdict.type !== "OK") {
-			// Step-based cycles are reported via status bar.
-			// Hard cycles could trigger a steer message (future enhancement).
-			_ctx.ui.setStatus("cycle-detect", `step: ${verdict.type} (${severity})`);
+		const modeLabel = state.shadow ? "[shadow]" : "[ACTIVE]";
+		ctx.ui.setStatus(
+			"cycle-detection",
+			`${modeLabel} step: ${verdict.type} (${severity})`,
+		);
+
+		// Intervene only on a new or escalating cycle, so we don't steer on
+		// every subsequent tool_result while the agent is in the same loop.
+		const escalated =
+			(state.lastStepSeverity === "none" && severity !== "none") ||
+			(state.lastStepSeverity === "warn" && severity === "hard");
+		state.lastStepSeverity = severity;
+
+		if (!state.shadow && escalated) {
+			pi.sendMessage(
+				{
+					customType: "cycle-detection",
+					content: makeStepSteer(verdict, severity),
+					display: true,
+				},
+				{ deliverAs: "steer", triggerTurn: false },
+			);
+			if (severity === "hard") void notifyDesktop();
 		}
 	});
 
-	// ── turn_end: reset stream status ──────────────────────────
+	// ── turn_end: reset transient stream status ────────────────
 
 	pi.on("turn_end", async (_event, ctx) => {
-		ctx.ui.setStatus("cycle-detect", "");
+		ctx.ui.setStatus("cycle-detection", statusText(state));
 	});
 
-	// ── Commands ───────────────────────────────────────────────
+	// ── Command: /cycle ────────────────────────────────────────
 
-	pi.registerCommand("cycle-stats", {
-		description: "Show cycle detection statistics",
-		handler: async (_args, ctx) => {
-			const tStats = state.thinkingDetector.getStats();
-			const txStats = state.textDetector.getStats();
-			const lines = [
-				"=== Cycle Detection Stats ===",
-				"",
-				"Step-based (tool calls):",
-				`  Records: ${state.stepRecords.length}`,
-				`  Warn detections: ${state.stepWarnCount}`,
-				`  Hard detections: ${state.stepHardCount}`,
-				`  Shadow: ${state.stepConfig.shadow ? "yes" : "no"}`,
-				"",
-				"Stream-based (thinking):",
-				`  Characters fed: ${tStats.charactersFed}`,
-				`  Sentences: ${tStats.sentencesExtracted}`,
-				`  Warn: ${tStats.warnDetections}`,
-				`  Hard: ${tStats.hardDetections}`,
-				`  Max repeat run: ${tStats.maxRepeatRun}`,
-				`  Min oscillation period: ${tStats.minOscillationPeriod ?? "none"}`,
-				`  Last: ${tStats.lastVerdict.type} (${tStats.lastSeverity})`,
-				"",
-				"Stream-based (text):",
-				`  Characters fed: ${txStats.charactersFed}`,
-				`  Sentences: ${txStats.sentencesExtracted}`,
-				`  Warn: ${txStats.warnDetections}`,
-				`  Hard: ${txStats.hardDetections}`,
-				`  Max repeat run: ${txStats.maxRepeatRun}`,
-				`  Min oscillation period: ${txStats.minOscillationPeriod ?? "none"}`,
-				`  Last: ${txStats.lastVerdict.type} (${txStats.lastSeverity})`,
-			];
-			ctx.ui.setWidget("cycle-stats", lines);
-		},
-	});
-
-	pi.registerCommand("cycle-mode", {
-		description: "Toggle cycle detection shadow/active mode",
-		getArgumentCompletions: (
-			prefix: string,
-		): Array<{ value: string; label: string }> | null => {
-			const modes = ["shadow", "active", "toggle"];
-			const items = modes.map((m) => ({ value: m, label: m }));
-			const filtered = items.filter((i) => i.value.startsWith(prefix));
-			return filtered.length > 0 ? filtered : null;
+	pi.registerCommand("cycle", {
+		description: "Cycle-detection monitor: status, stats, and controls",
+		getArgumentCompletions: (prefix: string) => {
+			const cmds = ["status", "stats", "enable", "disable", "shadow", "active"];
+			const items = cmds
+				.filter((c) => c.startsWith(prefix))
+				.map((c) => ({ value: c, label: c }));
+			return items.length > 0 ? items : null;
 		},
 		handler: async (args, ctx) => {
-			const action = args?.toLowerCase() ?? "toggle";
+			const cmd = (args || "status").trim().toLowerCase();
 
-			if (action === "shadow") {
-				state.stepConfig.shadow = true;
-				state.thinkingDetector.setConfig({ shadow: true });
-				state.textDetector.setConfig({ shadow: true });
-				ctx.ui.notify("Cycle detection: SHADOW mode (observe only)", "info");
-			} else if (action === "active") {
-				state.stepConfig.shadow = false;
-				state.thinkingDetector.setConfig({ shadow: false });
-				state.textDetector.setConfig({ shadow: false });
+			if (cmd === "status") {
+				const lines = [
+					"Cycle Detection Monitor",
+					`  Enabled: ${state.enabled}`,
+					`  Mode: ${state.shadow ? "shadow (observe only)" : "active"}`,
+					`  Steps tracked: ${state.stepStepIndex}`,
+					`  Step fires (warn/hard): ${state.stepWarnCount}/${state.stepHardCount}`,
+					`  Window: ${state.stepConfig.window}`,
+					`  T_repeat (warn/hard): ${state.stepConfig.tRepeatWarn}/${state.stepConfig.tRepeatHard}`,
+					`  P_max: ${state.stepConfig.pMax}`,
+					`  Warmup: ${state.stepConfig.warmupSteps}`,
+				];
+				ctx.ui.setWidget("cycle-detection", lines);
+				return;
+			}
+
+			if (cmd === "stats") {
+				const tStats = state.thinkingDetector.getStats();
+				const txStats = state.textDetector.getStats();
+				const lines = [
+					"=== Cycle Detection Stats ===",
+					"",
+					"Step-based (tool calls):",
+					`  Records: ${state.stepRecords.length}`,
+					`  Warn detections: ${state.stepWarnCount}`,
+					`  Hard detections: ${state.stepHardCount}`,
+					"",
+					"Stream-based (thinking):",
+					`  Characters fed: ${tStats.charactersFed}`,
+					`  Sentences: ${tStats.sentencesExtracted}`,
+					`  Warn / Hard: ${tStats.warnDetections} / ${tStats.hardDetections}`,
+					`  Max repeat run: ${tStats.maxRepeatRun}`,
+					`  Min oscillation period: ${tStats.minOscillationPeriod ?? "none"}`,
+					`  Last: ${tStats.lastVerdict.type} (${tStats.lastSeverity})`,
+					"",
+					"Stream-based (text):",
+					`  Characters fed: ${txStats.charactersFed}`,
+					`  Sentences: ${txStats.sentencesExtracted}`,
+					`  Warn / Hard: ${txStats.warnDetections} / ${txStats.hardDetections}`,
+					`  Max repeat run: ${txStats.maxRepeatRun}`,
+					`  Min oscillation period: ${txStats.minOscillationPeriod ?? "none"}`,
+					`  Last: ${txStats.lastVerdict.type} (${txStats.lastSeverity})`,
+				];
+				ctx.ui.setWidget("cycle-detection", lines);
+				return;
+			}
+
+			if (cmd === "enable") {
+				state.enabled = true;
+				ctx.ui.notify("Cycle detection enabled", "info");
+				ctx.ui.setStatus("cycle-detection", statusText(state));
+				return;
+			}
+
+			if (cmd === "disable") {
+				state.enabled = false;
+				ctx.ui.notify("Cycle detection disabled", "info");
+				ctx.ui.setStatus("cycle-detection", statusText(state));
+				return;
+			}
+
+			if (cmd === "shadow") {
+				state.shadow = true;
+				syncStreamShadow();
+				ctx.ui.notify("Cycle detection: shadow mode (observe only)", "info");
+				ctx.ui.setStatus("cycle-detection", statusText(state));
+				return;
+			}
+
+			if (cmd === "active") {
+				state.shadow = false;
+				syncStreamShadow();
 				ctx.ui.notify(
-					"Cycle detection: ACTIVE mode (will intervene)",
+					"Cycle detection: active mode (interventions enabled)",
 					"warning",
 				);
-			} else {
-				// Toggle
-				const next = !state.stepConfig.shadow;
-				state.stepConfig.shadow = next;
-				state.thinkingDetector.setConfig({ shadow: next });
-				state.textDetector.setConfig({ shadow: next });
-				ctx.ui.notify(
-					`Cycle detection: ${next ? "SHADOW" : "ACTIVE"}`,
-					next ? "info" : "warning",
-				);
+				ctx.ui.setStatus("cycle-detection", statusText(state));
+				return;
 			}
+
+			ctx.ui.notify(
+				`Unknown command: ${cmd}. Use: status, stats, enable, disable, shadow, active`,
+				"error",
+			);
 		},
 	});
 
@@ -475,12 +498,20 @@ export default function (pi: ExtensionAPI) {
 		state.stepStepIndex = 0;
 		state.stepWarnCount = 0;
 		state.stepHardCount = 0;
+		state.lastStepSeverity = "none";
+		state.pendingAbort = null;
 		state.thinkingDetector.resetFull();
 		state.textDetector.resetFull();
-		ctx.ui.setStatus("cycle-detect", "cycle-detect ready (active)");
+		ctx.ui.setStatus("cycle-detection", statusText(state));
 	});
 
 	pi.on("session_shutdown", async (_event, _ctx) => {
-		// Cleanup if needed
+		const total = state.stepWarnCount + state.stepHardCount;
+		if (total > 0) {
+			// Best-effort end-of-session summary (stderr — never the TUI stream).
+			process.stderr.write(
+				`[cycle-detection] Session ended. Step fires: ${total} (warn ${state.stepWarnCount}, hard ${state.stepHardCount})\n`,
+			);
+		}
 	});
 }

@@ -193,6 +193,35 @@ describe("detectExactRepeat", () => {
 		assert.ok(result !== null);
 		assert.deepStrictEqual(result!.stepIndices, [10, 11, 12, 13]);
 	});
+
+	it("does NOT fire when identical calls are interleaved with progress", () => {
+		// `git status` recurs with identical output, but real work happens
+		// between each — not a stuck loop, must not flag.
+		const records: StepRecord[] = [
+			makeRecord(0, "bash", { command: "git status" }, "clean", STATE_A),
+			makeRecord(1, "edit", { path: "a.ts" }, "edited a", STATE_B),
+			makeRecord(2, "bash", { command: "git status" }, "clean", STATE_A),
+			makeRecord(3, "edit", { path: "b.ts" }, "edited b", STATE_C),
+			makeRecord(4, "bash", { command: "git status" }, "clean", STATE_A),
+		];
+		const result = detectExactRepeat(records, 20, 3);
+		assert.equal(result, null);
+	});
+
+	it("fires only on the consecutive run, reporting its length", () => {
+		const records: StepRecord[] = [
+			makeRecord(0, "bash", { command: "ls" }, "out", STATE_A),
+			makeRecord(1, "read", { path: "x.ts" }, "content", STATE_B),
+			// Consecutive stuck run of 3:
+			makeRecord(2, "bash", { command: "npm test" }, "1 failing", STATE_C),
+			makeRecord(3, "bash", { command: "npm test" }, "1 failing", STATE_C),
+			makeRecord(4, "bash", { command: "npm test" }, "1 failing", STATE_C),
+		];
+		const result = detectExactRepeat(records, 20, 3);
+		assert.ok(result !== null);
+		assert.equal(result!.count, 3);
+		assert.deepStrictEqual(result!.stepIndices, [2, 3, 4]);
+	});
 });
 
 // ── detectOscillation ────────────────────────────────────────────

@@ -73,8 +73,16 @@ export type Severity = "warn" | "hard" | "none";
 // ── Detector 1: Exact Repeat ──────────────────────────────────
 /**
  * Detects when the same action with the same args produces the same
- * observation repeatedly. The observation guard is essential: same action
- * + changing output is progress or transient retry — must not flag.
+ * observation on a run of *consecutive* steps. The observation guard is
+ * essential: same action + changing output is progress or transient retry —
+ * must not flag.
+ *
+ * Consecutiveness matters: the same idempotent command (e.g. `git status`,
+ * `ls`) can legitimately recur across a window while the agent makes real
+ * progress in between. That is not a stuck loop — and is caught by the
+ * oscillation detector if it is structural. An exact-repeat is the agent
+ * issuing the identical call back-to-back with no change, so we require the
+ * repeats to be adjacent. We report the longest qualifying run in the window.
  */
 export function detectExactRepeat(
 	records: StepRecord[],
@@ -83,31 +91,37 @@ export function detectExactRepeat(
 ): { sig: [string, string]; count: number; stepIndices: number[] } | null {
 	// Guard: slice(-0) returns the full array in JS; treat window=0 as empty.
 	const recent = window <= 0 ? [] : records.slice(-window);
-	const bySig = new Map<string, StepRecord[]>();
+	if (recent.length === 0) return null;
 
-	for (const r of recent) {
-		const key = `${r.action_type}::${r.canonical_args}`;
-		const group = bySig.get(key) ?? [];
-		group.push(r);
-		bySig.set(key, group);
-	}
+	const sigOf = (r: StepRecord) => `${r.action_type}::${r.canonical_args}`;
+	const matches = (a: StepRecord, b: StepRecord) =>
+		sigOf(a) === sigOf(b) && a.observation_hash === b.observation_hash;
 
-	for (const [key, group] of bySig) {
-		if (group.length < tRepeat) continue;
-		// Observation guard: all observation hashes must be identical.
-		const firstHash = group[0].observation_hash;
-		const allSame = group.every((r) => r.observation_hash === firstHash);
-		if (allSame) {
-			const [action_type, canonical_args] = key.split("::") as [string, string];
-			return {
-				sig: [action_type, canonical_args],
-				count: group.length,
-				stepIndices: group.map((r) => r.step_index),
-			};
+	let bestStart = 0;
+	let bestLen = 1;
+	let runStart = 0;
+	for (let i = 1; i <= recent.length; i++) {
+		if (i < recent.length && matches(recent[i], recent[runStart])) continue;
+		const runLen = i - runStart;
+		if (runLen > bestLen) {
+			bestLen = runLen;
+			bestStart = runStart;
 		}
+		runStart = i;
 	}
 
-	return null;
+	if (bestLen < tRepeat) return null;
+
+	const run = recent.slice(bestStart, bestStart + bestLen);
+	const [action_type, canonical_args] = sigOf(run[0]).split("::") as [
+		string,
+		string,
+	];
+	return {
+		sig: [action_type, canonical_args],
+		count: bestLen,
+		stepIndices: run.map((r) => r.step_index),
+	};
 }
 
 // ── Detector 2: Oscillation ───────────────────────────────────
