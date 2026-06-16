@@ -26,8 +26,13 @@ Both detectors escalate **warn → hard** as the evidence grows.
   one-shot *steer* message asking the agent to change approach. It only steers
   when a cycle first appears or escalates — it will not spam every step.
 - **Stream cycles** (hard) abort the in-flight message, strip the looping
-  reasoning/tool calls, and steer a fresh turn. A desktop notification is
-  fired via `notify-send` when available.
+  reasoning/tool calls, and steer a fresh turn (with a `notify-send` desktop
+  notification when available).
+
+Stream detection is scoped to a **single message** (reset at `message_end`),
+so a sentence repeated in one message never counts toward the next — and it
+ignores short non-prose fragments (filenames, list markers, table cells) via
+`minSentenceWords`, so normal repetitive output does not trip it.
 
 It never kills the process — interventions are course corrections, not halts.
 

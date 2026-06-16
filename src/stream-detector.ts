@@ -54,13 +54,19 @@ export interface StreamConfig {
 	minRepsP2: number;
 	/** No flags until N sentences have accumulated. */
 	warmupSentences: number;
+	/** Minimum word count for a fragment to count as a "sentence". Filenames,
+	 * list markers, table cells, and other short fragments end with '.' but are
+	 * not prose — counting them produces false repeats on normal structured
+	 * output (e.g. a list of files like `plot1_unified.`). */
+	minSentenceWords: number;
 	/** When true, detection runs but onCycle is never called. Stats still accumulate. */
 	shadow: boolean;
 }
 
 /**
- * Conservative defaults — thinking text revisits ideas naturally.
- * Require strong evidence before flagging.
+ * Conservative defaults — thinking text revisits ideas naturally, and an
+ * assistant's answers legitimately contain repetitive structure (tables,
+ * lists, enumerations). Require strong evidence before flagging.
  */
 export const DEFAULT_STREAM_CONFIG: StreamConfig = {
 	window: 30,
@@ -70,8 +76,22 @@ export const DEFAULT_STREAM_CONFIG: StreamConfig = {
 	minRepsP1: 5,
 	minRepsP2: 3,
 	warmupSentences: 3,
+	minSentenceWords: 4,
 	shadow: false, // Start in active mode
 };
+
+/**
+ * Whether a split fragment is substantive enough to treat as a sentence.
+ * Counts only word-like tokens (containing a letter or digit), so punctuation
+ * runs, box-drawing table borders, and bare filenames don't qualify.
+ */
+function isSubstantive(sentence: string, minWords: number): boolean {
+	if (minWords <= 0) return true;
+	const words = sentence
+		.split(/\s+/)
+		.filter((w) => /[a-z0-9]/i.test(w));
+	return words.length >= minWords;
+}
 
 /** Accumulated statistics for shadow-mode tuning. */
 export interface StreamStats {
@@ -223,8 +243,11 @@ export class StreamDetector {
 		}
 		this.pendingText = remainder.trimStart() || "";
 
-		// Process new sentences
+		// Process new sentences. Insubstantial fragments (filenames, list
+		// markers, table cells) are skipped so they don't register as repeats.
 		for (const sentence of sentences) {
+			if (!isSubstantive(sentence, this.config.minSentenceWords)) continue;
+
 			const hash = hashSentence(sentence);
 			const offset =
 				this.totalChars - this.pendingText.length - sentence.length;

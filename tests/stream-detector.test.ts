@@ -26,12 +26,22 @@ import {
 
 // ── Helpers ──────────────────────────────────────────────────────
 
-/** Create a detector with known config and an optional onCycle spy. */
+/**
+ * Create a detector with known config and an optional onCycle spy.
+ *
+ * The short-sentence filter (minSentenceWords) is disabled by default here so
+ * these tests can exercise detection mechanics with terse synthetic sentences
+ * ("Alpha.", "Bravo."). The filter itself is covered in its own describe block
+ * by passing an explicit minSentenceWords.
+ */
 function createDetector(
 	config?: Partial<StreamConfig>,
 	onCycle?: (v: StreamVerdict, s: Severity) => void,
 ): StreamDetector {
-	return new StreamDetector({ ...DEFAULT_STREAM_CONFIG, ...config }, onCycle);
+	return new StreamDetector(
+		{ ...DEFAULT_STREAM_CONFIG, minSentenceWords: 0, ...config },
+		onCycle,
+	);
 }
 
 /** A sentence that will hash identically. */
@@ -86,6 +96,61 @@ describe("sentence splitting", () => {
 		const r = d.feed("   \n\t  ");
 		assert.equal(r.verdict.type, "OK");
 		assert.equal(d.getStats().sentencesExtracted, 0);
+	});
+});
+
+// ── Short-fragment filter (minSentenceWords) ─────────────────────
+
+describe("short-fragment filter", () => {
+	it("ignores a list of bare filenames that end with a period", () => {
+		// Regression: `plot1_unified.`, `plot2_neigh_sw.` … are not prose and
+		// must not register as repeated sentences.
+		const d = createDetector({
+			minSentenceWords: 4,
+			warmupSentences: 0,
+			tRepeatWarn: 3,
+			tRepeatHard: 5,
+		});
+		const files = [
+			"plot1_unified.",
+			"plot2_neigh_sw.",
+			"plot2_no_neigh.",
+			"plot2_no_sw.",
+			"plot3_unified.",
+			"plot_summary_stats.",
+			"plot_edge_usage.",
+			"plot_gap_histogram.",
+		];
+		for (const f of files) d.feed(`${f} `);
+		const stats = d.getStats();
+		assert.equal(stats.sentencesExtracted, 0);
+		assert.equal(stats.lastVerdict.type, "OK");
+	});
+
+	it("does not flag a single repeated short fragment", () => {
+		const d = createDetector({
+			minSentenceWords: 4,
+			warmupSentences: 0,
+			tRepeatWarn: 3,
+			tRepeatHard: 5,
+		});
+		for (let i = 0; i < 8; i++) d.feed("plot1_unified. ");
+		assert.equal(d.getStats().sentencesExtracted, 0);
+		assert.equal(d.getStats().lastVerdict.type, "OK");
+	});
+
+	it("still counts and flags genuine repeated prose sentences", () => {
+		const d = createDetector({
+			minSentenceWords: 4,
+			warmupSentences: 0,
+			tRepeatWarn: 3,
+			tRepeatHard: 5,
+		});
+		const prose = "I am going to read the file now.";
+		for (let i = 0; i < 4; i++) d.feed(`${prose} `);
+		const r = d.feed(`${prose} `);
+		assert.equal(r.verdict.type, "EXACT_REPEAT");
+		assert.equal(r.severity, "hard");
 	});
 });
 

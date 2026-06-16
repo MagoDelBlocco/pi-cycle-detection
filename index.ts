@@ -8,8 +8,10 @@
  *    the agent with a course-correction message (never kills the process).
  *
  * 2. **Stream-based**: monitors thinking_delta and text_delta character
- *    streams for sentence-level repetition. Fires mid-stream and can
- *    abort + recover the in-flight message.
+ *    streams for sentence-level repetition. Fires mid-stream and can abort +
+ *    recover the in-flight message. Detection is scoped to a single message
+ *    (reset at message_end) and ignores short non-prose fragments, so normal
+ *    repetitive output (tables, file lists) does not trip it.
  *
  * Active mode (default): both detectors run and intervene when cycles are
  * detected. Switch to shadow mode (observe only) via `/cycle shadow`.
@@ -17,7 +19,7 @@
 
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import {
 	runMonitor,
 	type StepRecord,
@@ -222,19 +224,47 @@ async function notifyDesktop(): Promise<void> {
 
 // ── Status Bar ─────────────────────────────────────────────────
 
-function statusText(state: CycleState): string {
-	if (!state.enabled) return "cycle-detection: off";
+function statusText(state: CycleState, theme: Theme): string {
+	if (!state.enabled) return theme.fg("dim", "cycle-detection: off");
 	const mode = state.shadow ? "shadow" : "active";
 	const fires = state.stepWarnCount + state.stepHardCount;
-	return fires > 0
-		? `cycle-detection: ${mode} (${fires} fires)`
-		: `cycle-detection: ${mode}`;
+	const label =
+		fires > 0
+			? `cycle-detection: ${mode} (${fires} fires)`
+			: `cycle-detection: ${mode}`;
+	// Shadow (observe-only) reads as informational; active as a healthy/armed
+	// state. Both are restored from theme colors so the footer is no longer a
+	// flat white string.
+	return theme.fg(state.shadow ? "accent" : "success", label);
+}
+
+/**
+ * Colored transient status shown while a cycle is actively being detected.
+ * Hard severity is an error (we're aborting/steering); warn is a warning.
+ */
+function detectionStatus(
+	theme: Theme,
+	modeLabel: string,
+	body: string,
+	severity: Severity | StreamSeverity,
+): string {
+	const color = severity === "hard" ? "error" : "warning";
+	return theme.fg(color, `${modeLabel} ${body}`);
 }
 
 // ── Extension Factory ──────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
 	const state = createState();
+
+	// Which info view (if any) is currently pinned in the widget above the
+	// editor. The widget is persistent UI — it stays until explicitly cleared —
+	// so we track what's shown to support toggle-off and an explicit `hide`.
+	let widgetView: "status" | "stats" | null = null;
+	const clearWidget = (ctx: { ui: { setWidget: (k: string, c: string[] | undefined) => void } }) => {
+		ctx.ui.setWidget("cycle-detection", undefined);
+		widgetView = null;
+	};
 
 	const syncStreamShadow = () => {
 		state.thinkingDetector.setConfig({ shadow: state.shadow });
@@ -271,11 +301,16 @@ export default function (pi: ExtensionAPI) {
 			const modeLabel = state.shadow ? "[shadow]" : "[ACTIVE]";
 			ctx.ui.setStatus(
 				"cycle-detection",
-				`${modeLabel} ${contentType}: ${verdict.type} (${severity})`,
+				detectionStatus(
+					ctx.ui.theme,
+					modeLabel,
+					`${contentType}: ${verdict.type} (${severity})`,
+					severity,
+				),
 			);
 		}
 
-		// Active mode only: abort on hard severity
+		// Active mode: abort on a hard stream cycle so we can recover.
 		if (!state.shadow && severity === "hard") {
 			state.pendingAbort = { verdict, severity, contentType };
 			ctx.abort();
@@ -295,6 +330,16 @@ export default function (pi: ExtensionAPI) {
 	pi.on("message_end", async (event, ctx) => {
 		if (event.message.role !== "assistant") return;
 
+		// Stream cycle detection is scoped to a single assistant message: a
+		// sentence repeated in this message must not count toward a "repeat" in
+		// the next one. Reset here, where the event reliably fires — relying on
+		// message_start alone let a previous message's repeats linger in the
+		// window and spuriously abort the *next*, unrelated stream.
+		const resetDetectors = () => {
+			state.thinkingDetector.reset();
+			state.textDetector.reset();
+		};
+
 		// If we flagged an abort, truncate the message and steer.
 		if (state.pendingAbort !== null) {
 			const abortInfo = state.pendingAbort;
@@ -312,15 +357,17 @@ export default function (pi: ExtensionAPI) {
 			);
 
 			state.pendingAbort = null;
-			ctx.ui.setStatus("cycle-detection", statusText(state));
+			resetDetectors();
+			ctx.ui.setStatus("cycle-detection", statusText(state, ctx.ui.theme));
 
 			void notifyDesktop();
 
 			return { message: truncated as never };
 		}
 
-		// Clear transient stream status after a normal message end.
-		ctx.ui.setStatus("cycle-detection", statusText(state));
+		// Normal end: clear status and reset for the next message.
+		resetDetectors();
+		ctx.ui.setStatus("cycle-detection", statusText(state, ctx.ui.theme));
 	});
 
 	// ── Step-based: tool_result ────────────────────────────────
@@ -361,7 +408,12 @@ export default function (pi: ExtensionAPI) {
 		const modeLabel = state.shadow ? "[shadow]" : "[ACTIVE]";
 		ctx.ui.setStatus(
 			"cycle-detection",
-			`${modeLabel} step: ${verdict.type} (${severity})`,
+			detectionStatus(
+				ctx.ui.theme,
+				modeLabel,
+				`step: ${verdict.type} (${severity})`,
+				severity,
+			),
 		);
 
 		// Intervene only on a new or escalating cycle, so we don't steer on
@@ -387,7 +439,7 @@ export default function (pi: ExtensionAPI) {
 	// ── turn_end: reset transient stream status ────────────────
 
 	pi.on("turn_end", async (_event, ctx) => {
-		ctx.ui.setStatus("cycle-detection", statusText(state));
+		ctx.ui.setStatus("cycle-detection", statusText(state, ctx.ui.theme));
 	});
 
 	// ── Command: /cycle ────────────────────────────────────────
@@ -395,7 +447,15 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("cycle", {
 		description: "Cycle-detection monitor: status, stats, and controls",
 		getArgumentCompletions: (prefix: string) => {
-			const cmds = ["status", "stats", "enable", "disable", "shadow", "active"];
+			const cmds = [
+				"status",
+				"stats",
+				"hide",
+				"enable",
+				"disable",
+				"shadow",
+				"active",
+			];
 			const items = cmds
 				.filter((c) => c.startsWith(prefix))
 				.map((c) => ({ value: c, label: c }));
@@ -404,7 +464,18 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const cmd = (args || "status").trim().toLowerCase();
 
+			if (cmd === "hide" || cmd === "clear" || cmd === "close") {
+				clearWidget(ctx);
+				return;
+			}
+
 			if (cmd === "status") {
+				// Re-running the visible view toggles it off, so the pinned
+				// widget is never a one-way trip.
+				if (widgetView === "status") {
+					clearWidget(ctx);
+					return;
+				}
 				const lines = [
 					"Cycle Detection Monitor",
 					`  Enabled: ${state.enabled}`,
@@ -415,12 +486,19 @@ export default function (pi: ExtensionAPI) {
 					`  T_repeat (warn/hard): ${state.stepConfig.tRepeatWarn}/${state.stepConfig.tRepeatHard}`,
 					`  P_max: ${state.stepConfig.pMax}`,
 					`  Warmup: ${state.stepConfig.warmupSteps}`,
+					"",
+					"  (run /cycle hide to dismiss)",
 				];
 				ctx.ui.setWidget("cycle-detection", lines);
+				widgetView = "status";
 				return;
 			}
 
 			if (cmd === "stats") {
+				if (widgetView === "stats") {
+					clearWidget(ctx);
+					return;
+				}
 				const tStats = state.thinkingDetector.getStats();
 				const txStats = state.textDetector.getStats();
 				const lines = [
@@ -446,22 +524,25 @@ export default function (pi: ExtensionAPI) {
 					`  Max repeat run: ${txStats.maxRepeatRun}`,
 					`  Min oscillation period: ${txStats.minOscillationPeriod ?? "none"}`,
 					`  Last: ${txStats.lastVerdict.type} (${txStats.lastSeverity})`,
+					"",
+					"  (run /cycle hide to dismiss)",
 				];
 				ctx.ui.setWidget("cycle-detection", lines);
+				widgetView = "stats";
 				return;
 			}
 
 			if (cmd === "enable") {
 				state.enabled = true;
 				ctx.ui.notify("Cycle detection enabled", "info");
-				ctx.ui.setStatus("cycle-detection", statusText(state));
+				ctx.ui.setStatus("cycle-detection", statusText(state, ctx.ui.theme));
 				return;
 			}
 
 			if (cmd === "disable") {
 				state.enabled = false;
 				ctx.ui.notify("Cycle detection disabled", "info");
-				ctx.ui.setStatus("cycle-detection", statusText(state));
+				ctx.ui.setStatus("cycle-detection", statusText(state, ctx.ui.theme));
 				return;
 			}
 
@@ -469,7 +550,7 @@ export default function (pi: ExtensionAPI) {
 				state.shadow = true;
 				syncStreamShadow();
 				ctx.ui.notify("Cycle detection: shadow mode (observe only)", "info");
-				ctx.ui.setStatus("cycle-detection", statusText(state));
+				ctx.ui.setStatus("cycle-detection", statusText(state, ctx.ui.theme));
 				return;
 			}
 
@@ -480,12 +561,12 @@ export default function (pi: ExtensionAPI) {
 					"Cycle detection: active mode (interventions enabled)",
 					"warning",
 				);
-				ctx.ui.setStatus("cycle-detection", statusText(state));
+				ctx.ui.setStatus("cycle-detection", statusText(state, ctx.ui.theme));
 				return;
 			}
 
 			ctx.ui.notify(
-				`Unknown command: ${cmd}. Use: status, stats, enable, disable, shadow, active`,
+				`Unknown command: ${cmd}. Use: status, stats, hide, enable, disable, shadow, active`,
 				"error",
 			);
 		},
@@ -502,7 +583,7 @@ export default function (pi: ExtensionAPI) {
 		state.pendingAbort = null;
 		state.thinkingDetector.resetFull();
 		state.textDetector.resetFull();
-		ctx.ui.setStatus("cycle-detection", statusText(state));
+		ctx.ui.setStatus("cycle-detection", statusText(state, ctx.ui.theme));
 	});
 
 	pi.on("session_shutdown", async (_event, _ctx) => {
