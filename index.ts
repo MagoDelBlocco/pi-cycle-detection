@@ -25,18 +25,18 @@ import {
 	type Verdict as StepVerdict,
 	type Severity,
 	DEFAULT_CONFIG,
-} from "./detector.js";
+} from "./src/detector.js";
 import {
 	canonicalizeArgs,
 	hashObservation,
 	hashOutcomeState,
-} from "./canonicalize.js";
+} from "./src/canonicalize.js";
 import {
 	StreamDetector,
 	DEFAULT_STREAM_CONFIG,
 	type StreamVerdict,
 	type Severity as StreamSeverity,
-} from "./stream-detector.js";
+} from "./src/stream-detector.js";
 
 // ── Extension State ────────────────────────────────────────────
 
