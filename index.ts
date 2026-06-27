@@ -71,6 +71,9 @@ interface CycleState {
 	// Stats aggregation
 	stepWarnCount: number;
 	stepHardCount: number;
+
+	// Turn tracking for steer arbitration
+	currentTurnIndex: number;
 }
 
 function createState(): CycleState {
@@ -225,7 +228,8 @@ async function notifyDesktop(): Promise<void> {
 // ── Status Bar ─────────────────────────────────────────────────
 
 function statusText(state: CycleState, theme: Theme): string {
-	if (!state.enabled) return theme.fg("dim", "cycle-detection: off");
+	if (!state.enabled)
+		return theme.bg("selectedBg", theme.fg("dim", "cycle-detection: off"));
 	const mode = state.shadow ? "shadow" : "active";
 	const fires = state.stepWarnCount + state.stepHardCount;
 	const label =
@@ -233,9 +237,11 @@ function statusText(state: CycleState, theme: Theme): string {
 			? `cycle-detection: ${mode} (${fires} fires)`
 			: `cycle-detection: ${mode}`;
 	// Shadow (observe-only) reads as informational; active as a healthy/armed
-	// state. Both are restored from theme colors so the footer is no longer a
-	// flat white string.
-	return theme.fg(state.shadow ? "accent" : "success", label);
+	// state. Both carry a matching background so the footer item reads as a
+	// pill, consistent with the mcp-client status item.
+	const fg = state.shadow ? "accent" : "success";
+	const bg = state.shadow ? "customMessageBg" : "toolSuccessBg";
+	return theme.bg(bg, theme.fg(fg, label));
 }
 
 /**
@@ -249,7 +255,8 @@ function detectionStatus(
 	severity: Severity | StreamSeverity,
 ): string {
 	const color = severity === "hard" ? "error" : "warning";
-	return theme.fg(color, `${modeLabel} ${body}`);
+	const bg = severity === "hard" ? "toolErrorBg" : "toolPendingBg";
+	return theme.bg(bg, theme.fg(color, `${modeLabel} ${body}`));
 }
 
 // ── Extension Factory ──────────────────────────────────────────
@@ -355,6 +362,7 @@ export default function (pi: ExtensionAPI) {
 				},
 				{ triggerTurn: true, deliverAs: "steer" },
 			);
+			pi.appendEntry("cycle-detection:steer", { turnIndex: state.currentTurnIndex });
 
 			state.pendingAbort = null;
 			resetDetectors();
@@ -432,11 +440,16 @@ export default function (pi: ExtensionAPI) {
 				},
 				{ deliverAs: "steer", triggerTurn: false },
 			);
+			pi.appendEntry("cycle-detection:steer", { turnIndex: state.currentTurnIndex });
 			if (severity === "hard") void notifyDesktop();
 		}
 	});
 
 	// ── turn_end: reset transient stream status ────────────────
+
+	pi.on("turn_start", async (event) => {
+		state.currentTurnIndex = event.turnIndex ?? 0;
+	});
 
 	pi.on("turn_end", async (_event, ctx) => {
 		ctx.ui.setStatus("cycle-detection", statusText(state, ctx.ui.theme));
